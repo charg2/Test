@@ -1,15 +1,18 @@
 ﻿#include <iostream>
 #include <chrono>
+#include <array>
+#include <fstream>
 #include <cstring>
 #include <immintrin.h>
 #include <vector>
 #include <memory>
 #include <iomanip>
 #include <thread>
-#include <functional>
-//#include "Memcpy.h"
-constexpr size_t TEST_CASE{ 1'0000 };
-constexpr size_t THREAD_COUNT{ 1 };
+#include <intrin.h>
+
+constexpr size_t TEST_CASE{ 100 };
+size_t EACH_SIZE{};
+size_t THREAD_COUNT{ std::thread::hardware_concurrency() / 2 };
 
 void avx2_memcpy( void* dest, const void* src, size_t size )
 {
@@ -47,202 +50,283 @@ void sse_memcpy( void* dest, const void* src, size_t size )
     std::memcpy( static_cast<char*>( dest ) + i, static_cast<const char*>( src ) + i, size - i );
 }
 
-template< std::invocable TTask >
-void DoTest( TTask&& func, const char* label )
-{
-    auto start = std::chrono::high_resolution_clock::now();
-    func();
-    auto end = std::chrono::high_resolution_clock::now();
 
-	/// 시간 단위에 맞춰 duration을 출력
-	if ( std::chrono::duration_cast<std::chrono::seconds>( end - start ).count() > 100 )
-	{
-		auto duration = std::chrono::duration_cast<std::chrono::seconds>( end - start ).count();
-		std::cout << label << "                   " << duration << " sec" << std::endl;
-		return;
-	}
-	if ( std::chrono::duration_cast<std::chrono::milliseconds>( end - start ).count() > 100 )
-	{
-		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>( end - start ).count();
-		std::cout << label << "                   " << duration << " ms" << std::endl;
-		return;
-	}
-	if ( std::chrono::duration_cast<std::chrono::microseconds>( end - start ).count() > 100 )
-	{
-		auto duration = std::chrono::duration_cast<std::chrono::microseconds>( end - start ).count();
-		std::cout << label << "                   " << duration << " us" << std::endl;
-		return;
-	}
-    if ( std::chrono::duration_cast<std::chrono::nanoseconds>( end - start ).count() > 100 )
+std::atomic< unsigned long long > totalNs{};
+
+
+auto Out( std::chrono::nanoseconds result, std::string_view label )
+{
+    using namespace std::chrono;
+
+    /// 시간 단위에 맞춰 duration을 출력
+    if ( duration_cast<seconds>( result ).count() > 100 )
     {
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>( end - start ).count();
+        auto duration = duration_cast<seconds>( result ).count();
+        std::cout << label << "                   " << duration << " sec" << std::endl;
+        return std::format( "{} sec", duration );
+    }
+    if ( duration_cast<milliseconds>( result ).count() > 100 )
+    {
+        auto duration = duration_cast<milliseconds>( result ).count();
+        std::cout << label << "                   " << duration << " ms" << std::endl;
+        return std::format( "{} ms", duration );
+    }
+    if ( duration_cast<microseconds>( result ).count() > 100 )
+    {
+        auto duration = duration_cast<microseconds>( result ).count();
+        std::cout << label << "                   " << duration << " us" << std::endl;
+        return std::format( "{} us", duration );
+    }
+    if ( duration_cast<nanoseconds>( result ).count() > 100 )
+    {
+        auto duration = duration_cast<nanoseconds>( result ).count();
         std::cout << label << "                   " << duration << " ns" << std::endl;
+        return std::format( "{} ns", duration );
+    }
+}
+
+template< std::invocable TTask >
+auto DoTestInternal( TTask&& task, std::string_view label )
+{
+    totalNs = 0;
+
+    using namespace std::chrono;
+
+    auto start{ high_resolution_clock::now() };
+    task();
+    auto end{ high_resolution_clock::now() };
+    auto result{ end - start };
+    totalNs += result.count();
+    return Out( totalNs.load() * 1ns, label );
+}
+
+
+template< std::invocable TTask >
+auto DoTestUsingMultiThread( TTask&& task, std::string_view label, int threadCount )
+{
+    using namespace std::chrono;
+
+    std::vector< std::thread > threads;
+    threads.reserve( threadCount );
+
+    totalNs = 0;
+
+    for ( int i = 0; i < threadCount; ++i )
+        threads.emplace_back( [ task, i ]()
+            {
+                auto start{ high_resolution_clock::now() };
+                task();
+                auto end{ high_resolution_clock::now() };
+                auto result{ end - start };
+                totalNs += result.count();
+            } );
+
+    for ( auto& thread : threads )
+        thread.join();
+
+    return Out( totalNs.load() * 1ns, label );
+}
+
+template< std::invocable TTask >
+auto DoTestOnThisThread( TTask&& task, std::string_view label )
+{
+    return DoTestInternal( task, label );
+}
+
+template< std::invocable TTask >
+auto DoTest( TTask&& task, std::string_view label, int threadCount )
+{
+    if ( threadCount == 1 )
+        return DoTestOnThisThread( task, label );
+    else
+        return DoTestUsingMultiThread( task, label, threadCount );
+}
+
+auto benchmark_memcpy( void* dest, const void* src, size_t size, std::string_view label, int threadCount = 1 )
+{
+    return DoTest( [ dest, src, size ]
+        {
+            for ( int i = 0; i < TEST_CASE; ++i )
+            {
+                std::memcpy( dest, src, size );
+            }
+        },
+        label,
+        threadCount );
+}
+
+auto benchmark_avx2_memcpy( void* dest, const void* src, size_t size, std::string_view label, int threadCount = 1 )
+{
+    return DoTest( [ dest, src, size ]
+        {
+            for ( int i = 0; i < TEST_CASE; ++i )
+            {
+                avx2_memcpy( dest, src, size );
+            }
+        },
+        label,
+        threadCount );
+}
+
+auto benchmark_avx512_memcpy( unsigned char* dest, const unsigned char* src, size_t size, std::string_view label, int threadCount = 1 )
+{
+    return DoTest( [ dest, src, size ]
+        {
+            for ( int i = 0; i < TEST_CASE; ++i )
+            {
+                avx512_memcpy( dest, src, size );
+            }
+        },
+        label,
+        threadCount );
+}
+
+auto benchmark_sse_memcpy( void* dest, const void* src, size_t size, std::string_view label, int threadCount = 1 )
+{
+    return DoTest( [ dest, src, size ]
+        {
+            for ( int i = 0; i < TEST_CASE; ++i )
+            {
+                sse_memcpy( dest, src, size );
+            }
+        },
+        label,
+        threadCount );
+}
+
+std::string ToSizeFormatString( size_t size )
+{
+    if ( size < 1024 )
+        return std::format( "{} bytes", size );
+    else if ( size < 1024 * 1024 )
+        return std::format( "{:.2f} KB", static_cast<double>( size ) / 1024 );
+    else if ( size < 1024 * 1024 * 1024 )
+        return std::format( "{:.2f} MB", static_cast<double>( size ) / ( 1024 * 1024 ) );
+    else
+        return std::format( "{:.2f} GB", static_cast<double>( size ) / ( 1024 * 1024 * 1024 ) );
+}
+
+void WriteFile( const std::vector< std::string >& vec, const std::string& filename )
+{
+    auto outFile{ std::ofstream( filename ) };
+    if ( !outFile )
+    {
+        std::cerr << "파일을 열 수 없습니다: " << filename << std::endl;
         return;
     }
+
+    for ( const auto& str : vec )
+    {
+        outFile << str << std::endl;
+    }
+
+    outFile.close();
 }
 
-template< std::invocable TTask >
-void DoTestUsingMultiThread( TTask&& func, const char* label )
+// 문자열의 왼쪽 공백을 제거하는 함수
+void ltrim( std::string& str )
 {
-    DoTest( [ & ]()
-        {
-            std::vector< std::thread > threads;
-			threads.reserve( std::thread::hardware_concurrency() );
-
-			for ( int i = 0; i < std::thread::hardware_concurrency(); ++i )
-				threads.emplace_back( func );
-
-			for ( auto& thread : threads )
-				thread.join();
-        },
-        label );
+    str.erase( 0, str.find_first_not_of( " \t\n\r\f\v" ) );
 }
 
-void benchmark_memcpy( void* dest, const void* src, size_t size, const char* label, int threadCount = 1 )
+// 문자열의 오른쪽 공백을 제거하는 함수
+void rtrim( std::string& str )
 {
-    if ( threadCount == 1 )
-    {
-        DoTest( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    std::memcpy( dest, src, size );
-                }
-            },
-            label );
-    }
-    else
-    {
-        DoTestUsingMultiThread( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    std::memcpy( dest, src, size );
-                }
-            },
-            label );
-    }
+    str.erase( str.find_last_not_of( " \t\n\r\f\v" ) + 1 );
 }
 
-void benchmark_avx2_memcpy( void* dest, const void* src, size_t size, const char* label, int threadCount = 1 )
+// 문자열의 양쪽 공백을 제거하는 함수
+void trim( std::string& str )
 {
-    if ( threadCount == 1 )
-    {
-        DoTest( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    avx2_memcpy( dest, src, size );
-                }
-            },
-            label );
-    }
-    else
-    {
-		DoTestUsingMultiThread( [ dest, src, size ]()
-			{
-				for ( int i = 0; i < TEST_CASE; ++i )
-				{
-					avx2_memcpy( dest, src, size );
-				}
-			},
-			label );
-    }
+    ltrim( str );
+    rtrim( str );
 }
 
 
-void benchmark_avx512_memcpy( unsigned char* dest, const unsigned char* src, size_t size, const char* label, int threadCount = 1 )
+std::pair< std::string, std::string > GetCPUInfo()
 {
-    if ( threadCount == 1 )
+    std::array<int, 4> cpui{};
+    std::array<int, 4> cpuiExt{};
+    char vendor[ 0x20 ];
+    char brand[ 0x40 ];
+
+    // CPU Vendor
+    __cpuid( cpui.data(), 0 );
+    *reinterpret_cast<int*>( vendor ) = cpui[ 1 ];
+    *reinterpret_cast<int*>( vendor + 4 ) = cpui[ 3 ];
+    *reinterpret_cast<int*>( vendor + 8 ) = cpui[ 2 ];
+    vendor[ 12 ] = '\0';
+
+    // CPU Brand
+    __cpuid( cpui.data(), 0x80000000 );
+    int nExIds = cpui[ 0 ];
+    if ( nExIds >= 0x80000004 )
     {
-        DoTest( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    avx512_memcpy( dest, src, size );
-                }
-            },
-            label );
+        memset( brand, 0, sizeof( brand ) );
+        for ( int i = 0x80000002; i <= 0x80000004; ++i ) {
+            __cpuid( cpuiExt.data(), i );
+            memcpy( brand + ( i - 0x80000002 ) * 16, cpuiExt.data(), sizeof( cpuiExt ) );
+        }
     }
-    else
-    {
-        DoTestUsingMultiThread( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    avx512_memcpy( dest, src, size );
-                }
-            },
-            label );
-    }
+
+    std::string vendorStr{ vendor };
+    std::string brandStr{ brand };
+
+    trim( vendorStr );
+    trim( brandStr );
+
+    return { std::move( vendorStr ), std::move( brandStr ) };
 }
 
-void benchmark_sse_memcpy( void* dest, const void* src, size_t size, const char* label, int threadCount = 1 )
-{
-    if ( threadCount == 1 )
-    {
-        DoTest( [ dest, src, size ]()
-            {
-                for ( int i = 0; i < TEST_CASE; ++i )
-                {
-                    sse_memcpy( dest, src, size );
-                }
-            },
-            label );
-    }
-    else
-    {
-		DoTestUsingMultiThread( [ dest, src, size ]()
-			{
-				for ( int i = 0; i < TEST_CASE; ++i )
-				{
-					sse_memcpy( dest, src, size );
-				}
-			},
-			label );
-    }
-}
-
+inline thread_local std::unique_ptr< unsigned char[] > src;
+inline thread_local std::unique_ptr< char[] > dest1;
+inline thread_local std::unique_ptr< char[] > dest2;
+inline thread_local std::unique_ptr< unsigned char[] > dest3;
+inline thread_local std::unique_ptr< char[] > dest4;
 
 int main()
 {
+    auto cpuInfo = GetCPUInfo();
+
+    std::vector< std::string > csvResult
+    {
+        //std::format( "THREAD {}, N {}, {}, {}", THREAD_COUNT, TEST_CASE, cpuInfo.first, cpuInfo.second ),
+        "size,fmt size,std::memcpy,AVX2 mempcy,AVX512 mempcy,SSE mempcy"
+    };
+
     std::vector< size_t > sizes;
     for ( size_t size = 16; size <= 1024 * 1024 * 100; size *= 2 )
         sizes.push_back( size + ( rand() % size ) );
 
     for ( const auto& size : sizes )
     {
-        auto src = std::make_unique< unsigned char[] >( size );
-        auto dest1 = std::make_unique< char[] >( size );
-        auto dest2 = std::make_unique< char[] >( size );
-        auto dest3 = std::make_unique< unsigned char[] >( size );
-        auto dest4 = std::make_unique< char[] >( size );
+        std::string result{ std::to_string( size ) + "," };
 
-        // src 배열을 초기화합니다.
-        for ( size_t i = 0; i < size; ++i )
-            src[ i ] = static_cast<char>( i );
+        EACH_SIZE = size;
 
-        std::cout << "Benchmarking memcpy with size ";
-        if ( size < 1024 )
-            std::cout << size << " bytes" << std::endl;
-        else if ( size < 1024 * 1024 )
-            std::cout << std::fixed << std::setprecision( 2 ) << static_cast<double>( size ) / 1024 << " KB" << std::endl;
-        else if ( size < 1024 * 1024 * 1024 )
-            std::cout << std::fixed << std::setprecision( 2 ) << static_cast<double>( size ) / ( 1024 * 1024 ) << " MB" << std::endl;
-        else
-            std::cout << std::fixed << std::setprecision( 2 ) << static_cast<double>( size ) / ( 1024 * 1024 * 1024 ) << " GB" << std::endl;
+        src = std::make_unique< unsigned char[] >( size );
+        dest1 = std::make_unique< char[] >( size );
+        dest2 = std::make_unique< char[] >( size );
+        dest3 = std::make_unique< unsigned char[] >( size );
+        dest4 = std::make_unique< char[] >( size );
 
+        std::cout << std::format( "memcpy size {}\n", ToSizeFormatString( size ) );
+        result += std::format( "{},", ToSizeFormatString( size ) );
         // 일반 memcpy 벤치마크
-        benchmark_memcpy( dest1.get(), src.get(), size, "Standard memcpy", THREAD_COUNT );
+        result += std::format( "{},", benchmark_memcpy( dest1.get(), src.get(), size, "std::memcpy", THREAD_COUNT ) );
         // AVX2를 사용한 memcpy 벤치마크
-        benchmark_avx2_memcpy( dest2.get(), src.get(), size, "AVX2 memcpy", THREAD_COUNT );
+        result += std::format( "{},", benchmark_avx2_memcpy( dest2.get(), src.get(), size, "AVX2 memcpy", THREAD_COUNT ) );
         // AVX-512를 사용한 memcpy 벤치마크
-        benchmark_avx512_memcpy( dest3.get(), src.get(), size, "AVX-512 memcpy", THREAD_COUNT );
+        result += std::format( "{},", benchmark_avx512_memcpy( dest3.get(), src.get(), size, "AVX-512 memcpy", THREAD_COUNT ) );
         // SSE를 사용한 memcpy 벤치마크
-        benchmark_sse_memcpy( dest4.get(), src.get(), size, "SSE memcpy", THREAD_COUNT );
+        result += std::format( "{}", benchmark_sse_memcpy( dest4.get(), src.get(), size, "SSE memcpy", THREAD_COUNT ) );
 
-		std::cout << std::endl;
+        csvResult.emplace_back( std::move( result ) );
+
+        std::cout << std::endl;
     }
+
+    WriteFile( csvResult, std::format( "Result_THREAD{}_N{}_{}.csv", THREAD_COUNT, TEST_CASE, cpuInfo.second ) );
 
     return 0;
 }
